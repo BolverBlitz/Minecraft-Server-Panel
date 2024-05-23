@@ -41,18 +41,24 @@ const io = socket(server, {
 let terminals = {};
 
 const createTerminal = (logDir, startupCommand) => {
-  const shell = "bash";
+  const isWindows = process.platform === 'win32';
+  const shell = isWindows ? 'powershell.exe' : 'bash';
   const pathOfRoot = path.join(logDir, "../root");
+  
   const ptyProcess = pty.spawn(shell, [], {
     name: "xterm-color",
     cwd: pathOfRoot,
     env: process.env,
   });
-  fs.ensureDirSync(logDir);
+
+  fs.ensureDirSync(logDir); // Ensure the log directory exists
   let serverPID = null;
-  let isServerRunning = false; // Ensure the log directory exists
+  let isServerRunning = false;
+
   return { ptyProcess, isServerRunning, startupCommand, serverPID };
 };
+
+
 const initializeTerminal = (serverId, terminalPty, logDir) => {
   const logFile = fs.createWriteStream(path.join(logDir, "server.log"), {
     flags: "a",
