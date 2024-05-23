@@ -44,7 +44,7 @@ const createTerminal = (logDir, startupCommand) => {
   const isWindows = process.platform === 'win32';
   const shell = isWindows ? 'powershell.exe' : 'bash';
   const pathOfRoot = path.join(logDir, "../root");
-  
+
   const ptyProcess = pty.spawn(shell, [], {
     name: "xterm-color",
     cwd: pathOfRoot,
@@ -57,7 +57,6 @@ const createTerminal = (logDir, startupCommand) => {
 
   return { ptyProcess, isServerRunning, startupCommand, serverPID };
 };
-
 
 const initializeTerminal = (serverId, terminalPty, logDir) => {
   const logFile = fs.createWriteStream(path.join(logDir, "server.log"), {
@@ -91,6 +90,41 @@ const initializeTerminal = (serverId, terminalPty, logDir) => {
   });
 };
 
+const downloadFile = async (url, dest) => {
+  const response = await axios({
+    method: 'get',
+    url,
+    responseType: 'stream',
+  });
+
+  const writer = fs.createWriteStream(dest);
+  response.data.pipe(writer);
+
+  return new Promise((resolve, reject) => {
+    writer.on('finish', () => {
+      writer.close(resolve);
+    });
+    writer.on('error', (err) => {
+      writer.close(() => reject(err));
+    });
+  });
+};
+
+const downloadServerJar = async (version, serverRoot) => {
+  const fabricUrl = `https://meta.fabricmc.net/v2/versions/loader/${version}/stable/stable/server/jar`;
+  const jarPath = path.join(serverRoot, 'server.jar');
+  await downloadFile(fabricUrl, jarPath);
+};
+
+const downloadMsh = async (serverRoot) => {
+  const mshUrl = 'https://msh.gekware.net/builds/linux/amd64/msh-v2.5.0-350c73e-linux-amd64.bin';
+  const mshPath = path.join(serverRoot, 'msh_server.bin');
+  await downloadFile(mshUrl, mshPath);
+
+  // Mark the msh file as executable
+  fs.chmodSync(mshPath, 0o755);
+};
+
 const SERVERS_BASE_PATH = path.join(__dirname, "server-directory");
 //create new server
 app.post("/servers", authenticate, async (req, res) => {
@@ -104,8 +138,8 @@ app.post("/servers", authenticate, async (req, res) => {
   fs.ensureDirSync(path.join(serverPath, "logs")); //create a logs directory
   // Extracting request data with default values
   const name = req.body.name || "Minecraft Server";
-  const startupCommand = `java -Xmx${req.body.memory}G -jar server.jar nogui`;
   const port = req.body.port || 25565;
+  const startupCommand = `./msh_server.bin -port ${port} -d 4 -file server.jar -allowkill 60 -timeout 60`;
   if (req.body.version === "latest") {
     req.body.version = "stable";
   } else if (!req.body.version) {
@@ -145,22 +179,54 @@ app.post("/servers", authenticate, async (req, res) => {
     }
   );
   try {
-    const fabricUrl = `https://meta.fabricmc.net/v2/versions/loader/${version}/stable/stable/server/jar`;
-    const response = await axios({
-      method: "get",
-      url: fabricUrl,
-      responseType: "stream",
-    });
-    const jarPath = path.join(serverRoot, "server.jar");
-    const writer = fs.createWriteStream(jarPath);
-    response.data.pipe(writer);
-    await new Promise((resolve, reject) => {
-      writer.on("finish", resolve);
-      writer.on("error", reject);
-    });
+    try {
+      await downloadServerJar(version, serverRoot);
+      console.log('server.jar downloaded successfully');
+      await downloadMsh(serverRoot);
+      console.log('msh downloaded successfully');
+    } catch (error) {
+      console.error('Error downloading files:', error);
+    }
     //write the port to the server.properties file
     const propertiesPath = path.join(serverRoot, "server.properties");
+    const mshConfPath = path.join(serverRoot, "msh-config.json");
     fs.ensureFileSync(propertiesPath);
+    fs.ensureFileSync(mshConfPath);
+    const mshStartParam = `-Xmx${req.body.memory}G -Xms${req.body.memory}G`;
+    const minecraftPort = parseInt(port, 10) + 1;
+    const mshConf = {
+      "Server": {
+        "Folder": "./",
+        "FileName": "server.jar",
+        "Version": version,
+        "Protocol": 760
+      },
+      "Commands": {
+        "StartServer": "java <Commands.StartServerParam> -jar <Server.FileName> nogui",
+        "StartServerParam": mshStartParam,
+        "StopServer": "stop",
+        "StopServerAllowKill": 10
+      },
+      "Msh": {
+        "Debug": 1,
+        "ID": "",
+        "MshPort": 0,
+        "MshPortQuery": 0,
+        "EnableQuery": true,
+        "TimeBeforeStoppingEmptyServer": 30,
+        "SuspendAllow": false,
+        "SuspendRefresh": -1,
+        "InfoHibernation": "                   §fserver status:\n                   §b§lHIBERNATING",
+        "InfoStarting": "                   §fserver status:\n                    §6§lWARMING UP",
+        "NotifyUpdate": true,
+        "NotifyMessage": true,
+        "Whitelist": [],
+        "WhitelistImport": false,
+        "ShowResourceUsage": false,
+        "ShowInternetUsage": false
+      }
+    }
+    fs.writeFileSync(mshConfPath, JSON.stringify(mshConf, null, 2));
     const propertiesContent = `
 #Minecraft server properties
 #Thu May 16 21:56:35 EDT 2024
@@ -201,7 +267,7 @@ op-permission-level=4
 player-idle-timeout=0
 prevent-proxy-connections=false
 pvp=true
-query.port=${port}
+query.port=${minecraftPort}
 rate-limit=0
 rcon.password=
 rcon.port=25575
@@ -211,7 +277,7 @@ resource-pack-id=
 resource-pack-prompt=
 resource-pack-sha1=
 server-ip=
-server-port=${port}
+server-port=${minecraftPort}
 simulation-distance=10
 spawn-animals=true
 spawn-monsters=true
@@ -381,7 +447,7 @@ io.on("connection", (socket) => {
   });
   socket.on("stopServer", () => {
     if (terminal && terminal.isServerRunning) {
-      terminal.ptyProcess.write("stop\n");
+      terminal.ptyProcess.write('\x03'); // Send CTRL+C to the server | Will try to stop the Minecraft server gracefully (/stop command) and kills it after the timeout (in start parameter/msh-config.json)
       fs.removeSync(
         path.join(SERVERS_BASE_PATH, socket.serverId, "./minecraft_pid.txt")
       );
